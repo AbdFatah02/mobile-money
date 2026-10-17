@@ -155,17 +155,109 @@ export const resendVerificationRateLimiter = rateLimit({
 // SEP-38 rate limiter (consumed by src/routes/sep38.ts)
 // ---------------------------------------------------------------------------
 
+/** SEP-38 price/quote endpoints: 60 requests per minute per client */
+export const SEP38_RATE_LIMIT = 60;
+export const SEP38_WINDOW_MS = 60 * 1000; // 1 minute
+
+const SEP38_KEY_PREFIX = "rl:sep38";
+
+function getSep38ClientKey(req: Request): string {
+  const subject =
+    (req as any).jwtUser?.sub ||
+    (req as any).jwtUser?.userId ||
+    (req as any).user?.id;
+
+  if (subject) {
+    return `${SEP38_KEY_PREFIX}:sub:${subject}`;
+  }
+
+  const ip = req.ip ?? "unknown";
+  return `${SEP38_KEY_PREFIX}:ip:${ip}`;
+}
+
+const SEP38_LUA_SCRIPT = `
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('PTTL', KEYS[1])
+return {current, ttl}
+`;
+
+async function incrementSep38Counter(
+  key: string,
+  windowMs: number,
+): Promise<{ count: number; ttlMs: number }> {
+  const result = (await redisClient.eval(SEP38_LUA_SCRIPT, {
+    keys: [key],
+    arguments: [String(windowMs)],
+  })) as [number, number];
+
+  return { count: result[0], ttlMs: result[1] > 0 ? result[1] : windowMs };
+}
+
+function logSep38RateLimitViolation(req: Request, key: string, count: number): void {
+  logger.warn(
+    {
+      event: "rate_limit_violation",
+      category: "security",
+      endpoint: req.path,
+      method: req.method,
+      clientKey: key,
+      count,
+      limit: SEP38_RATE_LIMIT,
+      windowMs: SEP38_WINDOW_MS,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      requestId: (req as any).requestId,
+      timestamp: new Date().toISOString(),
+    },
+    "[SEP38_RATE_LIMIT] Limit exceeded — possible high-frequency scraping",
+  );
+}
+
 /**
  * Rate limiter for SEP-38 price and quote endpoints.
- * Allows 60 requests per minute per IP to prevent high-frequency scraping.
+ * Allows 60 requests per minute per client (JWT sub or IP).
  */
-export const sep38RateLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    error: "Too Many Requests",
-    message: "SEP-38 rate limit exceeded. Maximum 60 requests per minute.",
-  },
-});
+export async function sep38RateLimiter(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const key = getSep38ClientKey(req);
+
+  try {
+    const { count, ttlMs } = await incrementSep38Counter(key, SEP38_WINDOW_MS);
+    const remaining = Math.max(0, SEP38_RATE_LIMIT - count);
+    const retrySecs = Math.ceil(ttlMs / 1000);
+
+    res.setHeader("X-RateLimit-Limit", SEP38_RATE_LIMIT.toString());
+    res.setHeader("X-RateLimit-Remaining", remaining.toString());
+    res.setHeader(
+      "X-RateLimit-Reset",
+      new Date(Date.now() + ttlMs).toISOString(),
+    );
+
+    if (count > SEP38_RATE_LIMIT) {
+      logSep38RateLimitViolation(req, key, count);
+
+      res.setHeader("Retry-After", String(retrySecs));
+      res.status(429).json({
+        error: "Too Many Requests",
+        message: `SEP-38 rate limit of ${SEP38_RATE_LIMIT} requests per minute exceeded. Retry in ${retrySecs} second(s).`,
+        retryAfter: retrySecs,
+      });
+      return;
+    }
+
+    next();
+  } catch (err) {
+    logger.error(
+      { err, key },
+      "[SEP38_RATE_LIMIT] Redis error — failing open",
+    );
+    next();
+  }
+}
+

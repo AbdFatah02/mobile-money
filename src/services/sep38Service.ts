@@ -28,6 +28,7 @@ export interface Sep38Quote {
   fee_fixed: string;
   fee: Sep38Fee;
   created_at: string;
+  status?: string;
 }
 
 export interface Sep38PriceDetails {
@@ -309,6 +310,7 @@ export class Sep38Service {
       fee_fixed: priceDetails.fee_fixed,
       fee: priceDetails.fee,
       created_at: createdAt,
+      status: "pending_execution",
     };
 
     await this.saveQuote(quote, quoteTTL);
