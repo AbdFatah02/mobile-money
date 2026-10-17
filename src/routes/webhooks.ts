@@ -9,6 +9,7 @@ import {
   verifyWebhookPayloadEd25519,
   derivePublicSigningKey,
 } from "../crypto/webhookSigning";
+import { verifyOrangeWebhookSignature } from "../services/mobilemoney/orangeWebhookVerifier";
 
 const router = Router();
 const transactionModel = new TransactionModel();
@@ -348,6 +349,55 @@ router.post(
       });
     } catch (error) {
       console.error("[webhook-airtel] Processing error", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+router.post(
+  "/orange",
+  verifyOrangeWebhookSignature,
+  async (req: Request, res: Response) => {
+    try {
+      const payload = req.body as FlatWebhookPayload;
+      if (!payload.transaction_id || !payload.event_type) {
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+      const transaction = await transactionModel.findById(
+        payload.transaction_id,
+      );
+      if (!transaction) {
+        return res.status(404).json({
+          error: "Transaction not found",
+          transaction_id: payload.transaction_id,
+        });
+      }
+      if (payload.status) {
+        const updated = await transactionModel.updateStatus(
+          transaction.id,
+          payload.status as TransactionStatus,
+        );
+        if (updated) {
+          logger.info(
+            `[webhook-orange] Updated transaction ${transaction.id} to ${payload.status}`,
+          );
+        } else {
+          logger.info(
+            `[webhook-orange] Skipped status transition for transaction ${transaction.id} to ${payload.status} (no-op or invalid state transition)`,
+          );
+        }
+      }
+      logger.info(
+        `[webhook-orange] Processed event ${payload.event_id} for transaction ${payload.transaction_id}`,
+      );
+      return res.status(200).json({
+        success: true,
+        event_id: payload.event_id,
+        transaction_id: payload.transaction_id,
+        processed_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error("[webhook-orange] Processing error", error);
       return res.status(500).json({ error: "Internal server error" });
     }
   },

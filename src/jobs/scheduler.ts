@@ -35,6 +35,7 @@ import { runDlqCleanupJob } from "../queue/dlq";
 import { runHighValueComplianceReportJob } from "./highValueComplianceReportJob";
 import { runStellarReconciliationJob } from "../workers/stellarReconciliation";
 import { runAirtelReconciliationWorker } from "../workers/airtelReconciliation";
+import { runQuoteExpirationJob } from "./quoteExpirationJob";
 import { withJobTrace } from "../queue/jobTracing";
 
 interface JobConfig {
@@ -247,6 +248,12 @@ const JOBS: JobConfig[] = [
     handler: async () => {
       await runAirtelReconciliationWorker();
     },
+  },
+  {
+    name: "sep38-quote-expiration",
+    // Every minute - sweeps expired firm quotes and releases reserved liquidity
+    schedule: process.env.SEP38_QUOTE_EXPIRATION_CRON || "* * * * *",
+    handler: runQuoteExpirationJob,
   },
 ];
 
